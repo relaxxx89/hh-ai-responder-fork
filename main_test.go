@@ -30,12 +30,22 @@ func TestVacancySkillAcceptsStringAndObject(t *testing.T) {
 }
 
 func TestNegotiationVacancyVisible(t *testing.T) {
-	body := []byte(`<a href="/vacancy/137067915?hhtmFrom=negotiation_list">DevOps Engineer</a>`)
-	if !negotiationVacancyVisible(body, 137067915) {
-		t.Fatal("expected vacancy link in negotiations page")
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{name: "html quote", body: `<a href="/vacancy/137067915">DevOps Engineer</a>`, want: true},
+		{name: "query string", body: `<a href="/vacancy/137067915?hhtmFrom=negotiation_list">DevOps Engineer</a>`, want: true},
+		{name: "json escaped slash", body: `{"url":"\/vacancy\/137067915"}`, want: true},
+		{name: "different vacancy", body: `<a href="/vacancy/137067916">Other</a>`, want: false},
 	}
-	if negotiationVacancyVisible(body, 137067916) {
-		t.Fatal("different vacancy must not match")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := negotiationVacancyVisible([]byte(tc.body), 137067915); got != tc.want {
+				t.Fatalf("negotiationVacancyVisible() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

@@ -1458,6 +1458,7 @@ type HHAIResponder struct {
 	aiFilterMu              sync.Mutex
 	lastAIFilterRequest     time.Time
 	aiRejected              map[string]struct{}
+	applicationUnverified   map[string]struct{}
 
 	eventWriter io.Writer
 	eventMu     sync.Mutex
@@ -1711,12 +1712,18 @@ func NewHHAIResponder(ctx context.Context, cfg Config) (*HHAIResponder, error) {
 
 	responder.eventWriter = out
 	responder.aiRejected = make(map[string]struct{})
+	responder.applicationUnverified = make(map[string]struct{})
 	if cfg.OutputPath != "" {
 		loaded, err := loadAIRejected(cfg.OutputPath)
 		if err != nil {
 			return nil, fmt.Errorf("load AI-rejected vacancies: %w", err)
 		}
 		responder.aiRejected = loaded
+		unverified, err := loadApplicationUnverified(cfg.OutputPath)
+		if err != nil {
+			return nil, fmt.Errorf("load unverified applications: %w", err)
+		}
+		responder.applicationUnverified = unverified
 	}
 	responder.searchParams = searchParams
 
@@ -1796,6 +1803,36 @@ func loadAIRejected(path string) (map[string]struct{}, error) {
 		return nil, err
 	}
 	return rejected, nil
+}
+
+func loadApplicationUnverified(path string) (map[string]struct{}, error) {
+	unverified := make(map[string]struct{})
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return unverified, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		var event ErrorResult
+		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil || event.Type != "application_unverified" {
+			continue
+		}
+		resume, _ := event.Context["resume"].(string)
+		vacancyID, ok := event.Context["vacancy_id"].(float64)
+		if resume != "" && ok {
+			unverified[aiRejectedKey(resume, int(vacancyID))] = struct{}{}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return unverified, nil
 }
 
 func (r *HHAIResponder) ResolveURL(endpoint string) string {
@@ -2687,7 +2724,10 @@ func (r *HHAIResponder) GetVacancyKeySkills(vacancyID int) ([]VacancySkill, erro
 		return nil, unexpectedHTTPStatus(resp.Status)
 	}
 	_, skills, err := extractVacancyDetails(resp.Body)
-	return skills, err
+	if err != nil && len(skills) == 0 {
+		return nil, err
+	}
+	return skills, nil
 }
 
 func extractVacancyDescription(body []byte) (string, error) {
@@ -2914,7 +2954,13 @@ func vacancyResponseVisible(vacancies []Vacancy, vacancyID int) bool {
 func negotiationVacancyVisible(body []byte, vacancyID int) bool {
 	vacancyPath := "/vacancy/" + strconv.Itoa(vacancyID)
 	text := html.UnescapeString(string(body))
-	return strings.Contains(text, vacancyPath+"?") || strings.Contains(text, vacancyPath+`\"`)
+	text = strings.ReplaceAll(text, `\/`, "/")
+	for _, suffix := range []string{"?", `"`, `'`, "&"} {
+		if strings.Contains(text, vacancyPath+suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 type browserCookie struct {
@@ -3144,21 +3190,26 @@ func (r *HHAIResponder) fetchNegotiationsPage() ([]byte, error) {
 }
 
 func (r *HHAIResponder) verifyVacancyResponse(vacancyID, page int) (bool, error) {
+	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		vacancies, err := r.fetchVacancyPage(page)
-		if err != nil {
-			return false, err
-		}
-		if vacancyResponseVisible(vacancies, vacancyID) {
+		// Negotiations is the authoritative fallback when search results omit
+		// response_url. Check it independently from the search read-back.
+		negotiations, negotiationErr := r.fetchNegotiationsPage()
+		if negotiationErr == nil && negotiationVacancyVisible(negotiations, vacancyID) {
 			return true, nil
 		}
-		negotiations, err := r.fetchNegotiationsPage()
-		if err != nil {
-			return false, err
+		if negotiationErr != nil {
+			lastErr = negotiationErr
 		}
-		if negotiationVacancyVisible(negotiations, vacancyID) {
+
+		vacancies, vacancyErr := r.fetchVacancyPage(page)
+		if vacancyErr == nil && vacancyResponseVisible(vacancies, vacancyID) {
 			return true, nil
 		}
+		if vacancyErr != nil {
+			lastErr = vacancyErr
+		}
+
 		if attempt < 2 {
 			timer := time.NewTimer(time.Duration(attempt+1) * time.Second)
 			select {
@@ -3169,7 +3220,7 @@ func (r *HHAIResponder) verifyVacancyResponse(vacancyID, page int) (bool, error)
 			}
 		}
 	}
-	return false, nil
+	return false, lastErr
 }
 
 func (r *HHAIResponder) ApplyVacancies() error {
@@ -3182,7 +3233,7 @@ func (r *HHAIResponder) ApplyVacancies() error {
 	// negotiation snapshot so a rerun cannot submit the same vacancy again.
 	existingNegotiations, negotiationsErr := r.fetchNegotiationsPage()
 	if negotiationsErr != nil {
-		logger.Warn("Could not load existing HH negotiations: %v", negotiationsErr)
+		return fmt.Errorf("cannot verify existing HH negotiations before applications: %w", negotiationsErr)
 	}
 
 	for page := 0; ; page++ {
@@ -3209,6 +3260,10 @@ func (r *HHAIResponder) ApplyVacancies() error {
 			}
 			if negotiationsErr == nil && negotiationVacancyVisible(existingNegotiations, vacancy.ID) {
 				logger.Info("Skipping vacancy %d: negotiation already exists in HH", vacancy.ID)
+				continue
+			}
+			if _, unverified := r.applicationUnverified[aiRejectedKey(r.resumeHash, vacancy.ID)]; unverified {
+				logger.Warn("Skipping vacancy %d: previous application is unverified; refusing duplicate", vacancy.ID)
 				continue
 			}
 			if r.maxResponses > 0 && vacancy.TotalResponsesCount > r.maxResponses {
@@ -3375,6 +3430,7 @@ func (r *HHAIResponder) ApplyVacancies() error {
 				if apiAccepted {
 					message = "HH accepted the request, but vacancy read-back did not confirm it"
 				}
+				r.applicationUnverified[aiRejectedKey(r.resumeHash, vacancy.ID)] = struct{}{}
 				logger.Warn("Application status is unverified for vacancy %s", vacancyURL)
 				r.writeEvent(ErrorResult{
 					Type: "application_unverified",
